@@ -1,0 +1,168 @@
+---
+title: "GHP 538 Final Proj"
+author: "Angela Stegmuller"
+date: "4/26/2023"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+
+
+```{r}
+library(sf) # manipulate simple (spatial) features
+library(spdep) # spatial statistics
+library(dplyr) # data management
+library(ggplot2) # visualization and mapping
+library(ggsn) # separate package for ggplot() north symbol & scale bar
+library(viridis) # color palette
+library(patchwork) # for plotting multiple ggplots together
+library(rgeoda) # for bivariate moran's I and other functions
+library(data.table) #making df
+library(lubridate) #for dates
+library(tigris) #county shapefile
+
+```
+
+
+create path
+```{r}
+path_to_data <- "/Users/angelastegmuller/Library/CloudStorage/OneDrive-HarvardUniversity/Spring 2023/GHP 538/final_proj"
+```
+
+Download LA shapefile from tigris package
+```{r}
+# download Louisiana counties shapefile
+la_counties_sp <- counties(state = "LA", cb = TRUE)
+summary(la_counties_sp$GEOID)
+la_counties_sp$fips<-as.numeric(la_counties_sp$GEOID)
+
+# convert to sf object
+la_counties_sf <- st_as_sf(la_counties_sp)
+
+
+# plot Louisiana counties
+ggplot() +
+  geom_sf(data = la_counties_sf)
+```
+Check CRS
+```{r}
+sf::st_crs(la_counties_sf) 
+
+```
+
+Creating weights using Queen's contiguity. 
+```{r}
+# (1a) Create a neighbors list based on Queen's contiguity
+queens_nb <- spdep::poly2nb(pl = la_counties_sf, 
+                            snap = 0.1, # edges < snap distance are "neighbors" this makes sure that edges are touching. 0.1 should be good 
+                            queen = TRUE) # queen=TRUE is default
+```
+Now trying with centroid-based
+```{r}
+# Create a new object with centroids for our polygons
+coords <- sf::st_centroid(st_geometry(la_counties_sf)) # This provides *just* the geometry
+                                                  
+head(coords)
+class(coords)
+
+plot(la_counties_sf[0])
+plot(coords, add=TRUE, col="blue")
+```
+creating weights 
+```{r}
+lw_queens <- spdep::nb2listw(neighbours = queens_nb, 
+                             style = 'W', # row-standardized 
+                             zero.policy = TRUE) # this is default: permit creation of
+                                                 #   list w object in cases where some 
+                                                 #   units have no neighbors. works for islands 
+
+class(lw_queens)
+names(lw_queens)
+lw_queens
+
+```
+
+Plot preterm birth
+
+```{r}
+ptb<-read.csv("/Users/angelastegmuller/Library/CloudStorage/OneDrive-HarvardUniversity/Spring 2023/GHP 538/final_proj/ptb_LA_2018-2021_Average.csv", stringsAsFactors = FALSE) 
+
+names(ptb)
+ptb<-ptb[-1,]
+
+ptb$county_fip<-as.numeric(ptb$fipscode)
+
+min(ptb$Preterm.Birth.Rate)
+max(ptb$Preterm.Birth.Rate)
+
+# join the preterm birth rates data with the parish shapefile
+parish_preterm <- left_join(la_counties_sp, ptb, by = c("fips" = "county_fip"))
+centroids <- st_centroid(parish_preterm) 
+class(centroids) # It's still an sf object with a dataframe
+plot(centroids[0])
+
+plot_ptb <-ggplot(parish_preterm) +
+  geom_sf(aes(fill = Preterm.Birth.Rate)) +
+  scale_fill_gradient(low = "white", high = "#A46A80") +
+  labs(title = "Preterm Birth Rates by Parish",
+       fill = "Preterm Birth Rate",
+       caption = "Source: March of Dimes") 
+plot_ptb
+```
+Now Global Moran's I
+```{r}
+### Global Moran's I statistic 
+moran_stat <- spdep::moran.test(x = parish_preterm$Preterm.Birth.Rate, listw = lw_queens)
+moran_stat
+
+# save the estimate for later
+moran_estimate <- as.numeric(moran_stat$estimate[1])
+
+# Create a Moran scatterplot
+
+# Standardize the preterm birth rate values as a Z-score before creating scatterplot
+parish_preterm$Preterm.Birth.Rate_z <- (parish_preterm$Preterm.Birth.Rate - mean(parish_preterm$Preterm.Birth.Rate))/sd(parish_preterm$Preterm.Birth.Rate)
+summary(parish_preterm$Preterm.Birth.Rate_z)
+
+
+moran_scatter<-spdep::moran.plot(x = parish_preterm$Preterm.Birth.Rate_z, listw = lw_queens,   
+                       xlim=c(-2.4, 3.5), # widen a bit so that labels fit
+                       labels=as.character(parish_preterm$Parish), # add labels
+                       xlab="Preterm birth (z)", 
+                       ylab="Spatially lagged preterm birth (z)")
+```
+Trying Moran's I. Is preterm birth completely spatially random in state of Louisiana? 
+
+H0: Preterm birth rate is completely spatially random in Louisiana
+
+Reject then null hypothesis with Global Moran's I of 0.369 and p-value <0.001, there is evidence of strong positive autocorrelation, meaning that similar preterm birth rates are close ot each other. 
+
+Parishes like Tensas, East Carroll, and Red River contribute to positive spatial autocorrelation and Cameron contributes to negative (dissimilar values nearby)
+
+Now onto local Moran's I
+```{r}
+# Scale the GEM value as a z-score
+parish_preterm$Preterm.Birth.Rate_v <- as.vector(scale(parish_preterm$Preterm.Birth.Rate))
+
+# Local moran functions from spdep
+local_moran <- spdep::localmoran(x = parish_preterm$Preterm.Birth.Rate_v, 
+                                 listw = lw_queens, # use our queens contiguity listw
+                                 alternative = "two.sided")
+
+local_moran <- spdep::localmoran_perm(x = parish_preterm$Preterm.Birth.Rate_v, 
+                                      nsim=999,
+                                 listw = lw_queens, # use our queens contiguity listw
+                                 alternative = "two.sided")
+summary(local_moran)
+class(local_moran)
+```
+```{r}
+hist(spdep::p.adjustSP(p = local_moran[,5], nb = queens_nb, method = "fdr"), 
+     breaks = 15, main="adjust FDR")
+# Histogram of current results
+hist(spdep::p.adjustSP(p = local_moran[,5], nb = queens_nb, method = "none"), 
+     breaks = 15, main="p-val; no adjustment")
+
+```
